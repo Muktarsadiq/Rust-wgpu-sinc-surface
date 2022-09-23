@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use std:: {iter, mem };
 use cgmath::{ Matrix, Matrix4, SquareMatrix };
 use wgpu::util::DeviceExt;
@@ -7,9 +8,10 @@ use winit::{
     event_loop::{ControlFlow, EventLoop},
 };
 use bytemuck:: {Pod, Zeroable, cast_slice};
-
-#[path="../src/transforms.rs"]
+#[path="transforms.rs"]
 mod transforms;
+#[path="surface_data.rs"]
+mod surface;
 
 const ANIMATION_SPEED:f32 = 1.0;
 const IS_PERSPECTIVE:bool = true;
@@ -17,22 +19,22 @@ const IS_PERSPECTIVE:bool = true;
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub struct Light {
-    color: [f32; 4],
     specular_color : [f32; 4],
     ambient_intensity: f32,
     diffuse_intensity :f32,
     specular_intensity: f32,
     specular_shininess: f32,
+    is_two_side: i32,
 }
 
-pub fn light(c:[f32; 3], sc:[f32;3], ai: f32, di: f32, si: f32, ss: f32) -> Light {
+pub fn light(sc:[f32;3], ambient: f32, diffuse: f32, specular: f32, shininess: f32, two_side: i32) -> Light {
     Light {
-        color:[c[0], c[1], c[2], 1.0],
         specular_color: [sc[0], sc[1], sc[2], 1.0],
-        ambient_intensity: ai,
-        diffuse_intensity: di,
-        specular_intensity: si,
-        specular_shininess: ss,
+        ambient_intensity: ambient,
+        diffuse_intensity: diffuse,
+        specular_intensity: specular,
+        specular_shininess: shininess,
+        is_two_side: two_side,
     }
 }
 
@@ -41,18 +43,32 @@ pub fn light(c:[f32; 3], sc:[f32;3], ai: f32, di: f32, si: f32, ss: f32) -> Ligh
 pub struct Vertex {
     pub position: [f32; 4],
     pub normal: [f32; 4],
+    pub color: [f32; 4],
 }
 
-#[allow(dead_code)]
-pub fn vertex(p:[f32;3], n:[f32; 3]) -> Vertex {
+pub fn vertex(p:[f32;3], n:[f32; 3], c:[f32; 3]) -> Vertex {
     Vertex {
         position: [p[0], p[1], p[2], 1.0],
         normal: [n[0], n[1], n[2], 1.0],
+        color: [c[0], c[1], c[2], 1.0],
     }
 }
 
+pub fn create_vertices(f: &dyn Fn(f32, f32) ->[f32;3], colormap_name: &str, xmin:f32, xmax:f32, zmin:f32, zmax:f32, 
+nx:usize, nz:usize, scale:f32, aspect:f32) -> Vec<Vertex> {
+    let (pts, yrange) = surface::simple_surface_points(f, xmin, xmax, zmin, zmax, nx, nz, scale, aspect);
+    let pos = surface::simple_surface_positions(&pts, nx, nz);
+    let normal = surface::simple_surface_normals(&pts, nx, nz);
+    let color = surface::simple_surface_colors(&pts, nx, nz, yrange, colormap_name);
+    let mut data:Vec<Vertex> = Vec::with_capacity(pos.len());
+    for i in 0..pos.len() {
+        data.push(vertex(pos[i], normal[i], color[i]));
+    }
+    data.to_vec()
+}
+
 impl Vertex {
-    const ATTRIBUTES: [wgpu::VertexAttribute; 2] = wgpu::vertex_attr_array![0=>Float32x4, 1=>Float32x4];
+    const ATTRIBUTES: [wgpu::VertexAttribute; 3] = wgpu::vertex_attr_array![0=>Float32x4, 1=>Float32x4, 2=>Float32x4];
     fn desc<'a>() -> wgpu::VertexBufferLayout<'a> {
         wgpu::VertexBufferLayout {
             array_stride: mem::size_of::<Vertex>() as wgpu::BufferAddress,
@@ -62,8 +78,8 @@ impl Vertex {
     }
 }
 
-struct State {
-    init: transforms::InitWgpu,
+pub struct State {
+    pub init: transforms::InitWgpu,
     pipeline: wgpu::RenderPipeline,
     vertex_buffer: wgpu::Buffer,
     uniform_bind_group:wgpu::BindGroup,
@@ -74,21 +90,22 @@ struct State {
 }
 
 impl State {
-    async fn new(window: &Window, vertex_data: &Vec<Vertex>, light_data: Light) -> Self {        
+    pub async fn new(window: &Window, vertex_data: &Vec<Vertex>, light_data: Light) -> Self {        
         let init =  transforms::InitWgpu::init_wgpu(window).await;
 
-        let shader = init.device.create_shader_module(&wgpu::ShaderModuleDescriptor {
+        let shader = init.device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
             //source: wgpu::ShaderSource::Wgsl(include_str!(concat!(env!("CARGO_MANIFEST_DIR"),"/examples/ch06/line3d.wgsl")).into()),
         });
 
         // uniform data
-        let camera_position = (3.0, 1.5, 3.0).into();
+        let camera_position = (3.5, 1.75, 3.5).into();
         let look_direction = (0.0,0.0,0.0).into();
         let up_direction = cgmath::Vector3::unit_y();
         
-        let (view_mat, project_mat, _) = transforms::create_view_projection(camera_position, look_direction, up_direction, 
+        let (view_mat, project_mat, _view_project_mat) = 
+            transforms::create_view_projection(camera_position, look_direction, up_direction, 
             init.config.width as f32 / init.config.height as f32, IS_PERSPECTIVE);
         
         // create vertex uniform buffer
@@ -197,18 +214,17 @@ impl State {
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
                 entry_point: "fs_main",
-                targets: &[wgpu::ColorTargetState {
+                targets: &[Some(wgpu::ColorTargetState {
                     format: init.config.format,
                     blend: Some(wgpu::BlendState {
                         color: wgpu::BlendComponent::REPLACE,
                         alpha: wgpu::BlendComponent::REPLACE,
                     }),
                     write_mask: wgpu::ColorWrites::ALL,
-                }],
+                })],
             }),
             primitive: wgpu::PrimitiveState{
                 topology: wgpu::PrimitiveTopology::TriangleList,
-                cull_mode: Some(wgpu::Face::Back),
                 ..Default::default()
             },
             //depth_stencil: None,
@@ -220,7 +236,7 @@ impl State {
                 bias: wgpu::DepthBiasState::default(),
             }),
             multisample: wgpu::MultisampleState::default(),
-            multiview: None
+            multiview: None,
         });
 
         let vertex_buffer = init.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -242,7 +258,7 @@ impl State {
         }
     }
 
-    fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
+    pub fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
         if new_size.width > 0 && new_size.height > 0 {
             self.init.size = new_size;
             self.init.config.width = new_size.width;
@@ -253,11 +269,11 @@ impl State {
     }
 
     #[allow(unused_variables)]
-    fn input(&mut self, event: &WindowEvent) -> bool {
+    pub fn input(&mut self, event: &WindowEvent) -> bool {
         false
     }
 
-    fn update(&mut self, dt: std::time::Duration) {
+    pub fn update(&mut self, dt: std::time::Duration) {
         // update uniform buffer
         let dt = ANIMATION_SPEED * dt.as_secs_f32(); 
         let model_mat = transforms::create_transforms([0.0,0.0,0.0], [dt.sin(), dt.cos(), 0.0], [1.0, 1.0, 1.0]);
@@ -274,7 +290,7 @@ impl State {
         self.init.queue.write_buffer(&self.vertex_uniform_buffer, 128, bytemuck::cast_slice(normal_ref));
     }
 
-    fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
+    pub fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
         //let output = self.init.surface.get_current_frame()?.output;
         let output = self.init.surface.get_current_texture()?;
         let view = output
@@ -305,7 +321,7 @@ impl State {
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Render Pass"),
-                color_attachments: &[wgpu::RenderPassColorAttachment {
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
                     ops: wgpu::Operations {
@@ -317,7 +333,7 @@ impl State {
                         }),
                         store: true,
                     },
-                }],
+                })],
                 //depth_stencil_attachment: None,
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &depth_view,
@@ -342,11 +358,11 @@ impl State {
     }
 }
 
-pub fn run(vertex_data: &Vec<Vertex>, light_data: Light, title: &str) {
+pub fn run(vertex_data: &Vec<Vertex>, light_data: Light, colormap_name: &str, title: &str) {
     env_logger::init();
     let event_loop = EventLoop::new();
     let window = winit::window::WindowBuilder::new().build(&event_loop).unwrap();
-    window.set_title(title);
+    window.set_title(&*format!("ch09_{}: {}", title, colormap_name));
 
     let mut state = pollster::block_on(State::new(&window, &vertex_data, light_data));    
     let render_start_time = std::time::Instant::now();
